@@ -1,0 +1,20 @@
+# docker compose up --build   ->  UI http://localhost:3000, API http://localhost:8000
+services:
+  backend:
+    build: ./backend
+    ports: ["8000:8000"]
+    environment:
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      RATE_LIMIT_PER_MIN: "60"
+      FEEDBACK_PATH: /srv/data/feedback.jsonl
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # optional: enables /explain
+    volumes: ["feedback:/srv/data"]
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://127.0.0.1:8000   # URL the *browser* uses to reach the API
+    ports: ["3000:3000"]
+    depends_on: [backend]
+volumes:
+  feedback:

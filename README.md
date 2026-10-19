@@ -1,55 +1,75 @@
-# CodeGuard AI — Starter MVP
+# CodeGuard AI
 
-Repository-aware debugging assistant. This starter implements deterministic code retrieval with TF-IDF, a FastAPI endpoint, and tests. It does **not** claim an LLM diagnosis is verified; the first milestone focuses on retrieval quality and a clean API contract.
+Debugging assistant: bug report + source files -> ranked, line-numbered code evidence, with optional
+opt-in AI explanation. Evidence is a **lead, not a verified diagnosis**. Scores are relative, not probabilities.
 
-## MVP flow
-1. Submit a bug report / stack trace and repository files.
-2. Split source files into line-numbered chunks.
-3. Rank chunks by TF-IDF similarity to the bug report.
-4. Return evidence with paths, line ranges, and scores.
-5. Later milestones add Git repository ingestion, LLM explanations, patch proposals, and isolated test execution.
+## What is implemented
+**Retrieval (backend, `app/`)**
+- BM25 over a code-aware tokenizer (splits `camelCase` / `snake_case`, keeps whole identifiers).
+- Syntax-aware chunking: Python via stdlib `ast` (parse only, never executes code); JS/TS, Java, C/C++, C#, Go,
+  Rust, PHP, Kotlin, Swift via a **heuristic** declaration splitter (not a real parser); everything else, and any
+  parse failure, falls back to line windows. Every result reports which strategy produced it.
+- Stack-trace parsing (Python, JS, Java/Kotlin, C#, Go, generic `file:line`) -> boosts for the named file, line range
+  and function, weighted toward the innermost frame. Symbols named in the report get a smaller boost.
+- Dedup of overlapping chunks and a per-file cap for result diversity.
+- Ignore rules (`.git`, `node_modules`, `dist`, binaries, lock files, secret files, `..` paths) and **secret
+  redaction** before indexing (line numbers preserved).
+- `POST /explain`: opt-in LLM explanation. Requires `consent: true` and `ANTHROPIC_API_KEY`. Code is delimited as
+  untrusted data, hypotheses without valid snippet citations are dropped, output is labelled "hypothesis - not verified".
+- `POST /feedback` (ids + labels only, never source), request IDs (`X-Request-ID`), structured logs without bodies,
+  per-IP rate limiting, CORS allow-list, server-side size limits.
 
-## Requirements
-- Python 3.11+
-- Git (optional for later repo-cloning milestone)
+**Frontend (`frontend/`)**: Workik-style workspace; folder and `.zip` upload (ignore rules applied in the browser, zip
+bomb guards); syntax-highlighted snippets; language/path/score filters; signal badges; Useful/Irrelevant feedback;
+Markdown/JSON export; opt-in browser-only history with delete; keyboard/ARIA improvements.
 
-## Run locally
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
+**Quality**: pytest suite, retrieval evaluation harness (`python -m eval.run_eval`), Vitest tests, ESLint, Docker
+Compose, GitHub Actions CI, pinned backend dependencies.
+
+## Not implemented (roadmap)
+Tree-sitter parsing, embeddings/semantic search, Git provider integration and incremental indexing, server-side
+history/accounts/auth, patch generation, sandboxed test execution, CI/PR integrations. Language support is
+extension-based; only Python has real syntax-aware chunking.
+
+## Run locally (Windows PowerShell)
+```
+cd backend
+python -m venv .venv ; .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+pytest
+python -m eval.run_eval
+uvicorn app.main:app --reload --port 8000
+
+cd ..\frontend
+copy .env.local.example .env.local
+npm install
+npm run lint ; npm test ; npm run dev
 ```
-Open http://127.0.0.1:8000/docs.
+Or: `docker compose up --build` (UI :3000, API :8000). To enable AI explanations set `ANTHROPIC_API_KEY` on the backend.
 
-## Test
-```bash
-pytest -q
+## API
+- `GET /health` -> `{status, version, llm_configured}`
+- `POST /analyze` `{bug_report, files[{path,content}], top_k 1-20, languages?, path_contains?, min_score?}`
+  -> `{mode, notice, files_indexed, chunks_searched, skipped[], warnings[], evidence[]}`
+- `POST /explain`, `POST /feedback` (see `app/schemas.py`)
+
+Limits: 10,000 report chars, 300 files, 500 KB/file, 5 MB total. Submitted code is never executed.
+
+## Evaluation (10 self-authored fixture cases; regression harness, not a benchmark)
 ```
+variant                            R@1   R@3   R@5   MRR   avg lines in hit chunk
+BM25 + line windows                0.70  1.00  1.00  0.85  11.5
++ syntax-aware chunks              0.70  1.00  1.00  0.85  2.7
++ stack/symbol boosts + dedup      0.90  1.00  1.00  0.95  2.7
 
-## Example request
-```bash
-curl -X POST http://127.0.0.1:8000/analyze \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "bug_report": "API returns 500 when user is missing. AttributeError accessing user.email",
-    "top_k": 3,
-    "files": [
-      {"path": "app/routes/users.py", "content": "def get_email(user):\\n    return user.email\\n"},
-      {"path": "app/utils/text.py", "content": "def normalize(text):\\n    return text.strip().lower()\\n"}
-    ]
-  }'
+Per language (full pipeline):
+  Go          R@1 1.00  MRR 1.00
+  Java        R@1 1.00  MRR 1.00
+  JavaScript  R@1 1.00  MRR 1.00
+  Python      R@1 1.00  MRR 1.00
+  Rust        R@1 1.00  MRR 1.00
+  TypeScript  R@1 0.00  MRR 0.50
+
+Misses (full pipeline): ['ts-lexical']
 ```
-
-## Security notes
-- This version accepts source text directly; it does not clone arbitrary URLs or execute submitted code.
-- Do not upload secrets, `.env` files, private keys, credentials, or proprietary code without authorization.
-- Never execute suggested patches against production systems.
-- Future test execution must use an isolated, resource-limited container with network access disabled by default.
-
-## Known limitations
-- TF-IDF is a retrieval baseline, not semantic understanding.
-- Ranking scores are relative similarity scores, not probabilities of correctness.
-- A high-ranked snippet is not proof of root cause.
-- There is no repository indexing persistence, auth, LLM, patch application, or sandbox execution yet.
+The remaining miss (`ts-lexical`) is a genuine lexical-mismatch case that semantic search would be needed to fix.
